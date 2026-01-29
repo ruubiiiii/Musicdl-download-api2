@@ -1,0 +1,6 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pyrogram==2.0.106
+TgCrypto==1.2.6
+boto3==1.42.37
+python-multipart==0.0.20
