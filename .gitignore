@@ -70,4 +70,9 @@ Thumbs.db
 # ============================================
 # KEEP THESE FILES
 # ============================================
+
+# ============================================
+# QOBUZ SESSION CACHE (contains auth tokens — never commit)
+# ============================================
+qobuz_sessions.json
 !.env.example

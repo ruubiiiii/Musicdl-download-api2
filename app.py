@@ -14,7 +14,7 @@ import boto3
 from botocore.config import Config
 import asyncio
 import os
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from io import BytesIO
 import uvicorn
 import tempfile
@@ -26,6 +26,9 @@ from asyncio import Lock, Event
 # Load environment variables from .env file
 from dotenv import load_dotenv
 load_dotenv()  # Load .env file before any os.getenv() calls
+
+# Qobuz downloader (multi-account rotation, CDN → R2 streaming)
+import qobuz_manager
 
 # Thread pool for parallel operations
 upload_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
@@ -657,7 +660,7 @@ async def download_from_telegram(url: str, bot_type: str, account_name: str = No
                 }
                 
                 # Return streaming URL (instant - no upload)
-                stream_url = f"http://localhost:8000/stream/{file_unique_id}"
+                stream_url = f"http://144.21.34.69:8000/stream/{file_unique_id}"
                 print(f"⚡ Instant response - streaming URL ready")
                 
                 complete_job(job_id, success=True)
@@ -730,6 +733,65 @@ class AuthStartRequest(BaseModel):
     phone: str  # '+212694375170'
 
 
+class QobuzDownloadRequest(BaseModel):
+    url: str                        # e.g. https://play.qobuz.com/track/12345678
+    quality: Optional[str] = "hi-res"  # mp3 | cd | hi-res | hi-res-max
+
+
+class QobuzJobRequest(BaseModel):
+    url: str
+    quality: Optional[str] = "hi-res"
+
+
+class QobuzJobResponse(BaseModel):
+    job_id: str
+    status: str
+    queue_position: int
+    url: str
+    quality: str
+    created_at: Optional[str]    = None
+    started_at: Optional[str]    = None
+    completed_at: Optional[str]  = None
+    result: Optional[Dict]       = None
+    error: Optional[str]         = None
+    account_used: Optional[str]  = None
+
+
+class QobuzTrackResult(BaseModel):
+    track_id: Optional[str] = None
+    track_number: Optional[int] = None
+    title: Optional[str] = None
+    download_url: Optional[str] = None
+    object_key: Optional[str] = None
+    error: Optional[str] = None
+    skipped: Optional[str] = None
+
+
+class QobuzDownloadResponse(BaseModel):
+    success: bool
+    type: Optional[str] = None          # 'track' or 'album'
+    # ---- track fields ----
+    track_id: Optional[str] = None
+    title: Optional[str] = None
+    performer: Optional[str] = None
+    album: Optional[str] = None
+    duration: Optional[int] = None
+    sampling_rate: Optional[float] = None
+    bit_depth: Optional[int] = None
+    quality_label: Optional[str] = None
+    download_url: Optional[str] = None
+    object_key: Optional[str] = None
+    # ---- album fields ----
+    album_id: Optional[str] = None
+    artist: Optional[str] = None
+    total_tracks: Optional[int] = None
+    downloaded: Optional[int] = None
+    tracks: Optional[List[QobuzTrackResult]] = None
+    # ---- common ----
+    account_used: Optional[str] = None
+    error: Optional[str] = None
+
+
 class AuthCodeRequest(BaseModel):
     account_number: str
     code: str  # Code received via Telegram/SMS
@@ -738,17 +800,32 @@ class AuthCodeRequest(BaseModel):
 # Startup and shutdown events
 @app.on_event("startup")
 async def startup_event():
-    """Initialize Telegram accounts and S3 client on startup."""
+    """Initialize Telegram accounts, S3 client, and Qobuz pool on startup."""
     try:
         # Pre-initialize S3 client (saves ~500ms on first request)
         print("☁️  Pre-warming R2 connection...")
         get_s3_client()
         print("✓ R2 client ready")
-        
+
         await initialize_telegram_clients()
         total = get_total_accounts()
         print(f"✓ API ready with {total} Telegram account(s)")
         print(f"✓ Rotation strategy: {ROTATION_STRATEGY}")
+
+        # Initialise Qobuz account pool
+        try:
+            qobuz_manager.initialize_qobuz()
+            print(f"✓ Qobuz pool ready ({qobuz_manager.qobuz_pool.total} account(s))")
+            # Start async job queue (needs the running event loop)
+            await qobuz_manager.start_queue(
+                s3_client=get_s3_client(),
+                r2_bucket=R2_BUCKET_NAME,
+                r2_public_url=R2_PUBLIC_URL,
+            )
+            print(f"✓ Qobuz job queue started ({qobuz_manager._QUEUE_WORKERS} workers)")
+        except Exception as qe:
+            print(f"⚠️  Qobuz pool init failed (continuing without Qobuz): {qe}")
+
     except Exception as e:
         print(f"✗ Failed to initialize: {e}")
         raise
@@ -777,10 +854,12 @@ async def root():
         "rotation_strategy": ROTATION_STRATEGY,
         "supported_platforms": list(MUSIC_BOTS.keys()),
         "endpoints": {
-            "POST /download": "Download music and get R2 URL",
+            "POST /download": "Download music via Telegram bot (Amazon/Deezer/Apple) → R2",
+            "POST /qobuz/download": "Download Qobuz track or album → R2 (direct CDN stream, no disk)",
+            "GET /qobuz/accounts": "Qobuz account pool status",
             "GET /queue": "View queue status for all account/bot combinations",
             "GET /jobs": "View all active and recent jobs",
-            "GET /health": "Health check"
+            "GET /health": "Health check",
         }
     }
 
@@ -915,6 +994,138 @@ async def health_check():
         "accounts": get_total_accounts(),
         "rotation": ROTATION_STRATEGY,
         "cached_files": len(file_cache)
+    }
+
+
+# ============================================================================
+# QOBUZ ENDPOINTS
+# ============================================================================
+
+@app.post("/qobuz/download", response_model=QobuzDownloadResponse)
+async def qobuz_download(request: QobuzDownloadRequest):
+    """
+    Download a Qobuz track or album and return a CloudFlare R2 link.
+
+    The audio is streamed **directly** from Qobuz CDN → R2 with zero
+    intermediate disk writes on the Oracle server.
+
+    Body Parameters
+    ---------------
+    url      : Qobuz track or album URL  
+               (play.qobuz.com / open.qobuz.com / www.qobuz.com)
+    quality  : 'mp3' | 'cd' | 'hi-res' (default) | 'hi-res-max'
+
+    Returns
+    -------
+    For a **track**: download_url + metadata  
+    For an **album**: list of per-track download_urls
+    """
+    if qobuz_manager.qobuz_pool.total == 0:
+        raise HTTPException(
+            status_code=503,
+            detail="Qobuz service unavailable: no accounts configured. "
+                   "Set QOBUZ_EMAIL_1 / QOBUZ_PASSWORD_1 in the server .env"
+        )
+
+    valid_qualities = list(qobuz_manager.QUALITY_MAP.keys())
+    if request.quality not in valid_qualities:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid quality '{request.quality}'. Choose from: {valid_qualities}"
+        )
+
+    try:
+        result = await qobuz_manager.download_qobuz(
+            url=request.url,
+            quality=request.quality,
+            s3_client=get_s3_client(),
+            r2_bucket=R2_BUCKET_NAME,
+            r2_public_url=R2_PUBLIC_URL,
+        )
+        return QobuzDownloadResponse(**result)
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Qobuz download failed: {exc}")
+
+
+@app.get("/qobuz/accounts")
+async def qobuz_accounts():
+    """Health status of all Qobuz accounts plus queue statistics."""
+    return {
+        **qobuz_manager.queue_stats(),
+        "qualities": list(qobuz_manager.QUALITY_MAP.keys()),
+    }
+
+
+@app.post("/qobuz/jobs", response_model=QobuzJobResponse, status_code=202)
+async def qobuz_submit_job(request: QobuzJobRequest):
+    """
+    **Async** download — returns a `job_id` immediately (HTTP 202).
+
+    Poll `GET /qobuz/jobs/{job_id}` for status.
+    When `status == 'completed'`, `result` contains the R2 URL(s).
+
+    quality: 'mp3' | 'cd' | 'hi-res' (default) | 'hi-res-max'
+    """
+    if qobuz_manager.qobuz_pool.available == 0:
+        raise HTTPException(
+            status_code=503,
+            detail="No available Qobuz accounts.",
+        )
+    valid_qualities = list(qobuz_manager.QUALITY_MAP.keys())
+    if request.quality not in valid_qualities:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid quality '{request.quality}'. Choose from: {valid_qualities}",
+        )
+    try:
+        job_id = await qobuz_manager.submit_download_job(request.url, request.quality)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    job = qobuz_manager.get_job_status(job_id)
+    return QobuzJobResponse(**job)
+
+
+@app.get("/qobuz/jobs", response_model=List[QobuzJobResponse])
+async def qobuz_list_jobs(limit: int = 50):
+    """List recent Qobuz download jobs (newest first)."""
+    jobs = qobuz_manager.list_jobs(limit=min(limit, 200))
+    return [QobuzJobResponse(**j) for j in jobs]
+
+
+@app.get("/qobuz/jobs/{job_id}", response_model=QobuzJobResponse)
+async def qobuz_get_job(job_id: str):
+    """Poll the status of a specific Qobuz download job."""
+    job = qobuz_manager.get_job_status(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+    return QobuzJobResponse(**job)
+
+
+@app.get("/qobuz/queue")
+async def qobuz_queue_stats():
+    """Current queue depth and per-health-state account counts."""
+    return qobuz_manager.queue_stats()
+
+
+@app.post("/qobuz/sessions/refresh")
+async def qobuz_refresh_sessions():
+    """
+    Force immediate re-authentication of all non-dead accounts, rotating
+    every token regardless of age.  Running this resets the 10-day expiry
+    clock for all accounts and saves new sessions to disk.
+    This operation runs in a background thread (non-blocking).
+    """
+    import concurrent.futures
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(
+        None, qobuz_manager.force_refresh_all_sessions
+    )
+    return {
+        "success": True,
+        "message": f"Re-authentication triggered for {result['triggered']} account(s)",
+        **result,
     }
 
 
