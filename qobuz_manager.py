@@ -812,23 +812,25 @@ class JobStatus(str, Enum):
 
 @dataclass
 class JobRecord:
-    job_id:       str
-    url:          str
-    quality:      str
-    status:       JobStatus         = JobStatus.QUEUED
-    created_at:   datetime          = field(default_factory=datetime.utcnow)
-    started_at:   Optional[datetime]= None
-    completed_at: Optional[datetime]= None
-    result:       Optional[Dict]    = None
-    error:        Optional[str]     = None
-    account_used: Optional[str]     = None
-    queue_position: int             = 0   # 0 = processing, >0 = waiting
+    job_id:         str
+    url:            str
+    quality:        str
+    upload_to_r2:   bool            = False
+    status:         JobStatus       = JobStatus.QUEUED
+    created_at:     datetime        = field(default_factory=datetime.utcnow)
+    started_at:     Optional[datetime] = None
+    completed_at:   Optional[datetime] = None
+    result:         Optional[Dict]  = None
+    error:          Optional[str]   = None
+    account_used:   Optional[str]   = None
+    queue_position: int             = 0
 
     def to_dict(self) -> Dict:
         return {
             "job_id":         self.job_id,
             "url":            self.url,
             "quality":        self.quality,
+            "upload_to_r2":   self.upload_to_r2,
             "status":         self.status,
             "queue_position": self.queue_position,
             "created_at":     self.created_at.isoformat(),
@@ -893,7 +895,7 @@ class QobuzDownloadQueue:
     # Job submission
     # ------------------------------------------------------------------
 
-    async def submit(self, url: str, quality: str) -> str:
+    async def submit(self, url: str, quality: str, upload_to_r2: bool = False) -> str:
         """Enqueue a download job. Returns job_id immediately."""
         if not self._started or self._queue is None:
             raise RuntimeError("Queue not started. Call queue.start() first.")
@@ -904,6 +906,7 @@ class QobuzDownloadQueue:
             job_id=job_id,
             url=url,
             quality=quality,
+            upload_to_r2=upload_to_r2,
             queue_position=position,
         )
         with self._lock:
@@ -972,6 +975,7 @@ class QobuzDownloadQueue:
                             None,
                             lambda: _process_track(
                                 item_id, fmt_id, client, account_id,
+                                rec.upload_to_r2,
                                 self._s3_client, self._r2_bucket, self._r2_public_url,
                             ),
                         )
@@ -980,6 +984,7 @@ class QobuzDownloadQueue:
                             None,
                             lambda: _process_album(
                                 item_id, fmt_id, client, account_id,
+                                rec.upload_to_r2,
                                 self._s3_client, self._r2_bucket, self._r2_public_url,
                             ),
                         )
@@ -1075,9 +1080,9 @@ async def start_queue(s3_client, r2_bucket: str, r2_public_url: str) -> None:
 # Public job API
 # ---------------------------------------------------------------------------
 
-async def submit_download_job(url: str, quality: str = DEFAULT_QUALITY) -> str:
+async def submit_download_job(url: str, quality: str = DEFAULT_QUALITY, upload_to_r2: bool = False) -> str:
     """Enqueue a download job and return the job_id immediately."""
-    return await qobuz_queue.submit(url, quality)
+    return await qobuz_queue.submit(url, quality, upload_to_r2)
 
 
 def get_job_status(job_id: str) -> Optional[Dict]:
@@ -1271,15 +1276,22 @@ def _stream_to_r2(
 async def download_qobuz(
     url: str,
     quality: str = DEFAULT_QUALITY,
+    upload_to_r2: bool = False,
     s3_client=None,
     r2_bucket: str = "",
     r2_public_url: str = "",
 ) -> Dict:
     """
-    Blocking convenience wrapper — acquires an account, downloads, releases.
-    Used by POST /qobuz/download (caller awaits the full result).
+    Resolve a Qobuz URL to a download URL.
 
-    For fire-and-forget use, call submit_download_job() instead.
+    Default (upload_to_r2=False):
+      Returns the signed Qobuz CDN URL in ~200-500 ms — no file transfer.
+      URL is valid for ~10 minutes, long enough for the client to start
+      downloading directly.
+
+    With upload_to_r2=True:
+      Streams the file to Cloudflare R2 and returns a permanent public URL.
+      Slow — takes as long as the file itself takes to download.
     """
     url_type, item_id = parse_qobuz_url(url)
     fmt_id = QUALITY_MAP.get(quality, QUALITY_MAP[DEFAULT_QUALITY])
@@ -1293,7 +1305,7 @@ async def download_qobuz(
                 None,
                 lambda: _process_track(
                     item_id, fmt_id, client, account_id,
-                    s3_client, r2_bucket, r2_public_url,
+                    upload_to_r2, s3_client, r2_bucket, r2_public_url,
                 ),
             )
         elif url_type == "album":
@@ -1301,7 +1313,7 @@ async def download_qobuz(
                 None,
                 lambda: _process_album(
                     item_id, fmt_id, client, account_id,
-                    s3_client, r2_bucket, r2_public_url,
+                    upload_to_r2, s3_client, r2_bucket, r2_public_url,
                 ),
             )
         else:
@@ -1321,7 +1333,7 @@ async def download_qobuz(
                 target=qobuz_pool.reauthenticate, args=(account_id,), daemon=True
             ).start()
         else:
-            qobuz_pool.mark_success(account_id)  # content problem, not account problem
+            qobuz_pool.mark_success(account_id)
         raise
 
     finally:
@@ -1343,12 +1355,21 @@ def _process_track(
     fmt_id: int,
     client,
     account_id: str,
-    s3_client,
-    bucket: str,
-    r2_public_url: str,
+    upload_to_r2: bool = False,
+    s3_client=None,
+    bucket: str = "",
+    r2_public_url: str = "",
 ) -> Dict:
-    """Download single track metadata + stream CDN → R2."""
-    meta = client.get_track_meta(track_id)
+    """
+    Resolve a Qobuz track to a download URL.
+
+    Default (upload_to_r2=False): returns the signed Qobuz CDN URL instantly
+    (~100-300 ms — just two API calls). Valid for ~10 minutes.
+
+    With upload_to_r2=True: streams the file to Cloudflare R2 and returns
+    a permanent public URL (slow — takes as long as the file download).
+    """
+    meta     = client.get_track_meta(track_id)
     url_data = client.get_track_url(track_id, fmt_id=fmt_id)
 
     if "sample" in url_data:
@@ -1366,27 +1387,33 @@ def _process_track(
     title      = meta.get("title", "Unknown")
     album_name = (meta.get("album") or {}).get("title", "Unknown")
     duration   = meta.get("duration", 0)
-
     ext        = "mp3" if int(fmt_id) == 5 else "flac"
-    safe_name  = _safe_filename(f"{performer} - {title}")
-    object_key = f"qobuz/{track_id}_{safe_name}.{ext}"
 
-    r2_url = _stream_to_r2(cdn_url, object_key, s3_client, bucket, r2_public_url, mime_type)
+    if upload_to_r2 and s3_client and bucket:
+        safe_name  = _safe_filename(f"{performer} - {title}")
+        object_key = f"qobuz/{track_id}_{safe_name}.{ext}"
+        download_url = _stream_to_r2(cdn_url, object_key, s3_client, bucket, r2_public_url, mime_type)
+        url_type = "r2"
+    else:
+        download_url = cdn_url
+        object_key   = None
+        url_type     = "cdn"  # signed, expires in ~10 min
 
     return {
-        "success": True,
-        "type": "track",
-        "track_id": track_id,
-        "title": title,
-        "performer": performer,
-        "album": album_name,
-        "duration": duration,
+        "success":       True,
+        "type":          "track",
+        "url_type":      url_type,
+        "track_id":      track_id,
+        "title":         title,
+        "performer":     performer,
+        "album":         album_name,
+        "duration":      duration,
         "sampling_rate": srate,
-        "bit_depth": bdepth,
+        "bit_depth":     bdepth,
         "quality_label": f"{bdepth}bit/{srate}kHz" if bdepth and srate else quality_label(fmt_id),
-        "download_url": r2_url,
-        "object_key": object_key,
-        "account_used": account_id,
+        "download_url":  download_url,
+        "object_key":    object_key,
+        "account_used":  account_id,
     }
 
 
@@ -1395,11 +1422,19 @@ def _process_album(
     fmt_id: int,
     client,
     account_id: str,
-    s3_client,
-    bucket: str,
-    r2_public_url: str,
+    upload_to_r2: bool = False,
+    s3_client=None,
+    bucket: str = "",
+    r2_public_url: str = "",
 ) -> Dict:
-    """Download all tracks in an album, streaming each to R2."""
+    """
+    Resolve all tracks in a Qobuz album to download URLs.
+
+    Default (upload_to_r2=False): returns signed CDN URLs for every track
+    instantly (one getFileUrl API call per track, runs in parallel).
+
+    With upload_to_r2=True: streams every track to R2 (slow).
+    """
     meta = client.get_album_meta(album_id)
 
     if not meta.get("streamable"):
@@ -1411,13 +1446,12 @@ def _process_album(
 
     results: List[Dict] = []
 
-    for track in tracks:
+    def _resolve_track(track):
         tid = str(track["id"])
         try:
             url_data = client.get_track_url(tid, fmt_id=fmt_id)
             if "sample" in url_data:
-                results.append({"track_id": tid, "skipped": "sample only"})
-                continue
+                return {"track_id": tid, "skipped": "sample only"}
 
             cdn_url   = url_data["url"]
             mime_type = url_data.get("mime_type", "audio/flac")
@@ -1425,33 +1459,44 @@ def _process_album(
             t_num     = track.get("track_number", 0)
             ext       = "mp3" if int(fmt_id) == 5 else "flac"
 
-            safe_name  = _safe_filename(f"{t_num:02d}_{t_title}")
-            object_key = f"qobuz/{album_id}/{tid}_{safe_name}.{ext}"
+            if upload_to_r2 and s3_client and bucket:
+                safe_name  = _safe_filename(f"{t_num:02d}_{t_title}")
+                object_key = f"qobuz/{album_id}/{tid}_{safe_name}.{ext}"
+                download_url = _stream_to_r2(cdn_url, object_key, s3_client, bucket, r2_public_url, mime_type)
+                url_type = "r2"
+            else:
+                download_url = cdn_url
+                object_key   = None
+                url_type     = "cdn"
 
-            r2_url = _stream_to_r2(cdn_url, object_key, s3_client, bucket, r2_public_url, mime_type)
-
-            results.append({
+            return {
                 "track_id":     tid,
                 "track_number": t_num,
                 "title":        t_title,
-                "download_url": r2_url,
+                "download_url": download_url,
                 "object_key":   object_key,
-            })
+                "url_type":     url_type,
+            }
         except Exception as exc:
             logger.error(f"  Track {tid} failed: {exc}")
-            results.append({"track_id": tid, "error": str(exc)})
+            return {"track_id": tid, "error": str(exc)}
+
+    # Resolve all track URLs in parallel (getFileUrl is independent per track)
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
+        results = list(pool.map(_resolve_track, tracks))
 
     downloaded = sum(1 for r in results if "download_url" in r)
 
     return {
-        "success": True,
-        "type": "album",
-        "album_id": album_id,
-        "title": album_title,
-        "artist": artist_name,
+        "success":      True,
+        "type":         "album",
+        "album_id":     album_id,
+        "title":        album_title,
+        "artist":       artist_name,
         "total_tracks": len(tracks),
-        "downloaded": downloaded,
-        "tracks": results,
+        "downloaded":   downloaded,
+        "tracks":       results,
         "account_used": account_id,
     }
 

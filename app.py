@@ -736,11 +736,14 @@ class AuthStartRequest(BaseModel):
 class QobuzDownloadRequest(BaseModel):
     url: str                        # e.g. https://play.qobuz.com/track/12345678
     quality: Optional[str] = "hi-res"  # mp3 | cd | hi-res | hi-res-max
+    upload_to_r2: bool = False      # False = return CDN URL instantly (~300ms)
+                                    # True  = stream to R2, return permanent link (slow)
 
 
 class QobuzJobRequest(BaseModel):
     url: str
     quality: Optional[str] = "hi-res"
+    upload_to_r2: bool = False
 
 
 class QobuzJobResponse(BaseModel):
@@ -1038,6 +1041,7 @@ async def qobuz_download(request: QobuzDownloadRequest):
         result = await qobuz_manager.download_qobuz(
             url=request.url,
             quality=request.quality,
+            upload_to_r2=request.upload_to_r2,
             s3_client=get_s3_client(),
             r2_bucket=R2_BUCKET_NAME,
             r2_public_url=R2_PUBLIC_URL,
@@ -1080,7 +1084,9 @@ async def qobuz_submit_job(request: QobuzJobRequest):
             detail=f"Invalid quality '{request.quality}'. Choose from: {valid_qualities}",
         )
     try:
-        job_id = await qobuz_manager.submit_download_job(request.url, request.quality)
+        job_id = await qobuz_manager.submit_download_job(
+            request.url, request.quality, request.upload_to_r2
+        )
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
     job = qobuz_manager.get_job_status(job_id)
