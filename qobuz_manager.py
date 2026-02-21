@@ -418,8 +418,10 @@ class QobuzClientPool:
                             saved.get("app_id", app_id),
                             saved["secret"],
                         )
-                        # Quick validation: metadata call (no signing needed)
-                        client.get_track_meta(_HEALTH_CHECK_TRACK_ID)
+                        # Trust the token if it's less than 1 day old — no network call needed.
+                        # For older tokens do a quick canary check to catch silent expiry.
+                        if age > 86400:
+                            client.get_track_meta(_HEALTH_CHECK_TRACK_ID)
                         with lock:
                             self._clients[acc_id]    = client
                             self._emails[acc_id]     = email
