@@ -888,7 +888,6 @@ class QobuzDownloadQueue:
         # Periodically purge old jobs
         asyncio.create_task(self._purge_loop())
         self._started = True
-        logger.info(f"✓ Qobuz job queue started ({self._num_workers} workers)")
 
     # ------------------------------------------------------------------
     # Job submission
