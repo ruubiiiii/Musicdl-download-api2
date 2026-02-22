@@ -30,6 +30,12 @@ load_dotenv()  # Load .env file before any os.getenv() calls
 # Qobuz downloader (multi-account rotation, CDN → R2 streaming)
 import qobuz_manager
 
+# Beatport direct API client (account pool, CDN URL extraction)
+import beatport_client
+
+# Beatport account pool — initialised in startup_event()
+beatport_pool: "beatport_client.BeatportAccountPool | None" = None
+
 # Thread pool for parallel operations
 upload_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
@@ -800,6 +806,11 @@ class AuthCodeRequest(BaseModel):
     code: str  # Code received via Telegram/SMS
 
 
+class BeatportDownloadRequest(BaseModel):
+    url: str                              # Beatport track URL or raw track ID
+    quality: Optional[str] = "lossless"  # lossless | high | medium
+
+
 # Startup and shutdown events
 @app.on_event("startup")
 async def startup_event():
@@ -828,6 +839,31 @@ async def startup_event():
             print(f"✓ Qobuz job queue started ({qobuz_manager._QUEUE_WORKERS} workers)")
         except Exception as qe:
             print(f"⚠️  Qobuz pool init failed (continuing without Qobuz): {qe}")
+
+        # Initialise Beatport account pool
+        try:
+            global beatport_pool
+            _bp_accounts = os.path.join(os.path.dirname(__file__), "beatport_accounts.json")
+            _bp_cache    = os.path.join(os.path.dirname(__file__), ".beatport_tokens")
+            beatport_pool = beatport_client.load_pool_from_file(
+                accounts_path=_bp_accounts,
+                cache_dir=_bp_cache,
+                strategy="round_robin",
+                cooldown=60,
+            )
+            print(f"✓ Beatport pool ready ({beatport_pool.total} account(s)) — pre-warming tokens...")
+            # Pre-warm all accounts in a background thread so the first
+            # real request never blocks on OAuth. Non-fatal if it fails.
+            def _prewarm():
+                try:
+                    r = beatport_pool.prewarm(max_workers=20)
+                    print(f"✓ Beatport pre-warm done — ok={r['ok']} skipped={r['skipped']} failed={r['failed']}")
+                except Exception as pwe:
+                    print(f"⚠️  Beatport pre-warm error: {pwe}")
+            import threading as _threading
+            _threading.Thread(target=_prewarm, daemon=True).start()
+        except Exception as be:
+            print(f"⚠️  Beatport pool init failed (continuing without Beatport): {be}")
 
     except Exception as e:
         print(f"✗ Failed to initialize: {e}")
@@ -860,6 +896,8 @@ async def root():
             "POST /download": "Download music via Telegram bot (Amazon/Deezer/Apple) → R2",
             "POST /qobuz/download": "Download Qobuz track or album → R2 (direct CDN stream, no disk)",
             "GET /qobuz/accounts": "Qobuz account pool status",
+            "POST /beatport/download": "Return direct CDN URL for a Beatport track (no download)",
+            "GET /beatport/accounts": "Beatport account pool status",
             "GET /queue": "View queue status for all account/bot combinations",
             "GET /jobs": "View all active and recent jobs",
             "GET /health": "Health check",
@@ -1132,6 +1170,85 @@ async def qobuz_refresh_sessions():
         "success": True,
         "message": f"Re-authentication triggered for {result['triggered']} account(s)",
         **result,
+    }
+
+
+# ============================================================================
+# BEATPORT ENDPOINTS
+# ============================================================================
+
+@app.post("/beatport/download")
+async def beatport_download(request: BeatportDownloadRequest):
+    """
+    Return the direct CDN download URL for a Beatport track.
+
+    No audio is downloaded to the server — the CDN URL is extracted and
+    returned immediately so the caller can fetch it themselves.
+
+    Body Parameters
+    ---------------
+    url     : Beatport track URL (any locale) or raw numeric track ID
+    quality : 'lossless' (default) | 'high' | 'medium'
+
+    Returns
+    -------
+    Track metadata + download_url (pre-signed CDN link, typically ~1 hour TTL)
+    """
+    global beatport_pool
+    if beatport_pool is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Beatport service unavailable: no accounts configured. "
+                   "Ensure beatport_accounts.json exists next to app.py.",
+        )
+
+    valid_qualities = list(beatport_client.QUALITY_MAP.keys())
+    if request.quality not in valid_qualities:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid quality '{request.quality}'. Choose from: {valid_qualities}",
+        )
+
+    # Accept raw numeric ID or full URL
+    try:
+        track_id = int(request.url)
+    except ValueError:
+        try:
+            track_id = beatport_client.parse_track_id(request.url)
+        except ValueError as ve:
+            raise HTTPException(status_code=400, detail=str(ve))
+
+    try:
+        loop   = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, beatport_pool.get_track_with_download, track_id)
+    except RuntimeError as re:
+        raise HTTPException(status_code=503, detail=str(re))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Beatport request failed: {exc}")
+
+    if not result.get("success"):
+        raise HTTPException(
+            status_code=400,
+            detail=result.get("error", "Unknown Beatport error"),
+        )
+
+    return result
+
+
+@app.get("/beatport/accounts")
+async def beatport_accounts_status():
+    """Compact health summary of the Beatport account pool."""
+    global beatport_pool
+    if beatport_pool is None:
+        return {
+            "accounts":  {"total": 0, "available": 0, "cooling": 0,
+                          "strategy": None, "cooldown_seconds": 0},
+            "qualities": list(beatport_client.QUALITY_MAP.keys()),
+            "note":      "Beatport pool not initialised",
+        }
+    return {
+        "accounts":  beatport_pool.status(),
+        "qualities": list(beatport_client.QUALITY_MAP.keys()),
     }
 
 
