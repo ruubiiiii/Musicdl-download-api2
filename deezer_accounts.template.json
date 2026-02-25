@@ -1,0 +1,13 @@
+[
+  {
+    "_comment": "OPTION A (recommended): email + password — ARL is fetched and cached automatically",
+    "_subscription": "Account must have Deezer HiFi / Premium for lossless FLAC downloads.",
+    "email": "your@email.com",
+    "password": "yourpassword"
+  },
+  {
+    "_comment": "OPTION B: raw ARL token — grab from deezer.com browser cookies (lasts ~3 months)",
+    "_how_to_get": "deezer.com → F12 → Application → Cookies → https://www.deezer.com → find 'arl' → copy Value",
+    "arl": "<paste-192-char-arl-here>"
+  }
+]

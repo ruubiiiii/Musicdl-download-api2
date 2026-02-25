@@ -33,8 +33,14 @@ import qobuz_manager
 # Beatport direct API client (account pool, CDN URL extraction)
 import beatport_client
 
+# Deezer direct API client (account pool, Blowfish decrypt, no Telegram)
+import deezer_client
+
 # Beatport account pool — initialised in startup_event()
 beatport_pool: "beatport_client.BeatportAccountPool | None" = None
+
+# Deezer account pool — initialised in startup_event()
+deezer_pool: "deezer_client.DeezerAccountPool | None" = None
 
 # Thread pool for parallel operations
 upload_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
@@ -811,6 +817,13 @@ class BeatportDownloadRequest(BaseModel):
     quality: Optional[str] = "lossless"  # lossless | high | medium
 
 
+class DeezerDownloadRequest(BaseModel):
+    url: str                              # Deezer track URL or raw track ID
+    quality: Optional[str] = "lossless"  # lossless | high | medium
+    upload_to_r2: bool = True             # True = upload to R2 (permanent URL)
+                                          # False = return streaming URL
+
+
 # Startup and shutdown events
 @app.on_event("startup")
 async def startup_event():
@@ -839,6 +852,29 @@ async def startup_event():
             print(f"✓ Qobuz job queue started ({qobuz_manager._QUEUE_WORKERS} workers)")
         except Exception as qe:
             print(f"⚠️  Qobuz pool init failed (continuing without Qobuz): {qe}")
+
+        # Initialise Deezer direct account pool
+        try:
+            global deezer_pool
+            _dz_accounts = os.path.join(os.path.dirname(__file__), "deezer_accounts.json")
+            _dz_cache    = os.path.join(os.path.dirname(__file__), ".deezer_tokens")
+            deezer_pool = deezer_client.load_pool_from_file(
+                accounts_path=_dz_accounts,
+                cache_dir=_dz_cache,
+                strategy="round_robin",
+                cooldown=120,
+            )
+            print(f"✓ Deezer direct pool ready ({deezer_pool.total} account(s)) — pre-warming tokens...")
+            def _dz_prewarm():
+                try:
+                    deezer_pool.prewarm()
+                    print(f"✓ Deezer pre-warm done")
+                except Exception as pwe:
+                    print(f"⚠️  Deezer pre-warm error: {pwe}")
+            import threading as _threading
+            _threading.Thread(target=_dz_prewarm, daemon=True).start()
+        except Exception as dze:
+            print(f"⚠️  Deezer pool init failed (continuing without direct Deezer): {dze}")
 
         # Initialise Beatport account pool
         try:
@@ -893,7 +929,9 @@ async def root():
         "rotation_strategy": ROTATION_STRATEGY,
         "supported_platforms": list(MUSIC_BOTS.keys()),
         "endpoints": {
-            "POST /download": "Download music via Telegram bot (Amazon/Deezer/Apple) → R2",
+            "POST /download": "Download music via Telegram bot (Amazon/Deezer/Apple) — Deezer tries direct API first",
+            "POST /deezer/download": "Download Deezer track → direct API (pool) with Telegram fallback",
+            "GET /deezer/accounts": "Deezer direct account pool status",
             "POST /qobuz/download": "Download Qobuz track or album → R2 (direct CDN stream, no disk)",
             "GET /qobuz/accounts": "Qobuz account pool status",
             "POST /beatport/download": "Return direct CDN URL for a Beatport track (no download)",
@@ -947,7 +985,7 @@ async def download_music(request: DownloadRequest, background_tasks: BackgroundT
     
     Supported platforms:
     - amazon: Amazon Music
-    - deezer: Deezer
+    - deezer: Deezer (tries direct API pool first, falls back to Telegram @deezload2bot)
     - apple: Apple Music
     """
     # Validate platform
@@ -956,7 +994,24 @@ async def download_music(request: DownloadRequest, background_tasks: BackgroundT
             status_code=400,
             detail=f"Invalid platform. Supported: {list(MUSIC_BOTS.keys())}"
         )
-    
+
+    # ── Deezer: attempt direct API pool before Telegram ────────────────────
+    if request.platform == "deezer" and deezer_pool is not None and deezer_pool.total > 0:
+        try:
+            track_id = deezer_client.parse_track_id(request.url)
+            print(f"🎵 Deezer direct via /download: track {track_id}")
+            direct = await _deezer_direct_download(track_id, "lossless", upload_to_r2=False)
+            return DownloadResponse(
+                success=True,
+                download_url=direct["download_url"],
+                artist=direct["artist"],
+                title=direct["title"],
+                duration=direct["duration"],
+                file_size=direct["file_size"],
+            )
+        except Exception as dz_err:
+            print(f"⚠️  Deezer direct failed in /download: {dz_err} — falling back to Telegram")
+
     # Download from Telegram bot (streams directly to R2)
     # Passes optional account parameter for load balancing
     result = await download_from_telegram(request.url, request.platform, request.account)
@@ -987,43 +1042,64 @@ async def download_music(request: DownloadRequest, background_tasks: BackgroundT
 
 @app.get("/stream/{file_unique_id}")
 async def stream_file(file_unique_id: str):
-    """Stream audio file directly from Telegram (no R2 storage)."""
-    
+    """Stream audio file — from Deezer in-memory bytes or from Telegram (no R2 storage)."""
+
     # Check cache
     if file_unique_id not in file_cache:
         raise HTTPException(404, "File not found or expired")
-    
+
     cache_entry = file_cache[file_unique_id]
-    
+
     # Check expiry
     if time.time() > cache_entry['expires']:
         del file_cache[file_unique_id]
         raise HTTPException(410, "File link expired")
-    
-    # Get the Telegram client for this account
+
+    # ── Deezer direct bytes path ──────────────────────────────────────────
+    if cache_entry.get("deezer_bytes") is not None:
+        audio_bytes   = cache_entry["deezer_bytes"]
+        content_type  = cache_entry.get("content_type", "audio/flac")
+        filename      = cache_entry.get("filename", "track.flac").replace('"', "'")
+        file_size     = cache_entry.get("file_size", len(audio_bytes))
+
+        async def deezer_generator():
+            chunk_size = 65536
+            for offset in range(0, len(audio_bytes), chunk_size):
+                yield audio_bytes[offset:offset + chunk_size]
+
+        return StreamingResponse(
+            deezer_generator(),
+            media_type=content_type,
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Content-Length": str(file_size),
+            },
+        )
+
+    # ── Telegram stream path ──────────────────────────────────────────────
     account_name = cache_entry['account']
     if account_name not in telegram_clients:
         raise HTTPException(503, "Telegram account unavailable")
-    
-    client = telegram_clients[account_name]
+
+    client  = telegram_clients[account_name]
     message = cache_entry['message']
-    
+
     async def stream_generator():
         """Stream chunks from Telegram."""
         async for chunk in client.stream_media(message):
             yield chunk
-    
+
     # Get filename for Content-Disposition
     filename = f"{message.audio.performer} - {message.audio.title}.flac"
     filename = filename.replace('"', "'")  # Escape quotes
-    
+
     return StreamingResponse(
         stream_generator(),
         media_type="audio/flac",
         headers={
             "Content-Disposition": f'attachment; filename="{filename}"',
-            "Content-Length": str(message.audio.file_size)
-        }
+            "Content-Length": str(message.audio.file_size),
+        },
     )
 
 
@@ -1174,6 +1250,72 @@ async def qobuz_refresh_sessions():
 
 
 # ============================================================================
+# DEEZER DIRECT DOWNLOAD HELPER
+# ============================================================================
+
+async def _deezer_direct_download(track_id: int, quality: str, upload_to_r2: bool) -> dict:
+    """
+    Download a Deezer track via the direct API pool (no Telegram).
+    Returns dict with 'success', 'download_url', 'artist', 'title', etc.
+    Raises on hard failure so caller can fall back to Telegram.
+    """
+    loop   = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, deezer_pool.get_track, track_id, quality)
+    if not result.get("success"):
+        raise RuntimeError(result.get("error", "Deezer direct download failed"))
+
+    audio_bytes = result["audio_bytes"]
+    extension   = result.get("extension", "flac")
+    artist      = result.get("artist", "")
+    title       = result.get("title", "")
+    duration    = result.get("duration", 0)
+    file_size   = len(audio_bytes)
+
+    if upload_to_r2:
+        # Stream to R2
+        import hashlib as _hs
+        key_hash   = _hs.md5(str(track_id).encode()).hexdigest()[:8]
+        safe_title = f"{artist} - {title}".replace(" ", "_").replace("/", "-")[:60]
+        object_key = f"deezer/{key_hash}_{safe_title}.{extension}"
+        file_bytes = BytesIO(audio_bytes)
+        loop2      = asyncio.get_event_loop()
+        public_url = await loop2.run_in_executor(
+            upload_executor,
+            upload_bytes_to_r2,
+            file_bytes,
+            object_key,
+            file_size,
+        )
+        schedule_file_deletion(object_key, delay_seconds=300)
+    else:
+        # Cache in memory and return stream URL
+        import hashlib as _hs
+        stream_key = f"dz_{_hs.md5(str(track_id).encode()).hexdigest()[:12]}"
+        # Store bytes in file_cache so /stream/{key} can serve them
+        file_cache[stream_key] = {
+            "account":        None,
+            "message":        None,
+            "deezer_bytes":   audio_bytes,
+            "extension":      extension,
+            "content_type":   "audio/flac" if extension == "flac" else "audio/mpeg",
+            "filename":       f"{artist} - {title}.{extension}",
+            "file_size":      file_size,
+            "expires":        time.time() + FILE_CACHE_TTL,
+        }
+        public_url = f"http://144.21.34.69:8000/stream/{stream_key}"
+
+    return {
+        "success":      True,
+        "download_url": public_url,
+        "artist":       artist,
+        "title":        title,
+        "duration":     duration,
+        "file_size":    file_size,
+        "source":       "direct",
+    }
+
+
+# ============================================================================
 # BEATPORT ENDPOINTS
 # ============================================================================
 
@@ -1233,6 +1375,89 @@ async def beatport_download(request: BeatportDownloadRequest):
         )
 
     return result
+
+
+# ============================================================================
+# DEEZER ENDPOINTS
+# ============================================================================
+
+@app.post("/deezer/download")
+async def deezer_download(request: DeezerDownloadRequest):
+    """
+    Download a Deezer track and return a download URL.
+
+    Primary path: direct Deezer API (Blowfish decrypt, no Telegram).
+    Fallback path: Telegram @deezload2bot (if direct fails or pool unavailable).
+
+    Body Parameters
+    ---------------
+    url        : Deezer track URL, short link, or raw numeric track ID
+    quality    : 'lossless' (default) | 'high' | 'medium'
+    upload_to_r2: True (default) = permanent R2 URL | False = streaming URL
+    """
+    # ── Resolve track ID ─────────────────────────────────────────────────────
+    try:
+        track_id = deezer_client.parse_track_id(request.url)
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+
+    valid_qualities = list(deezer_client.QUALITY_FORMATS.keys())
+    if request.quality not in valid_qualities:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid quality '{request.quality}'. Choose from: {valid_qualities}",
+        )
+
+    # ── Try direct pool first ─────────────────────────────────────────────────
+    if deezer_pool is not None and deezer_pool.total > 0:
+        try:
+            print(f"🎵 Deezer direct: track {track_id} (quality={request.quality})")
+            result = await _deezer_direct_download(track_id, request.quality, request.upload_to_r2)
+            return result
+        except Exception as direct_err:
+            print(f"⚠️  Deezer direct failed for {track_id}: {direct_err} — falling back to Telegram")
+
+    # ── Fallback: Telegram @deezload2bot ──────────────────────────────────────
+    print(f"🔄 Deezer Telegram fallback for track {track_id}")
+    if not telegram_clients:
+        raise HTTPException(
+            status_code=503,
+            detail="Deezer direct API pool unavailable and no Telegram accounts connected.",
+        )
+
+    deezer_url = request.url if request.url.startswith("http") else f"https://www.deezer.com/track/{track_id}"
+    tg_result  = await download_from_telegram(deezer_url, "deezer")
+    if not tg_result.get("success"):
+        raise HTTPException(
+            status_code=502,
+            detail=f"Deezer download failed (direct + Telegram): {tg_result.get('error')}",
+        )
+
+    return {
+        "success":      True,
+        "download_url": tg_result["public_url"],
+        "artist":       tg_result.get("performer"),
+        "title":        tg_result.get("title"),
+        "duration":     tg_result.get("duration"),
+        "file_size":    tg_result.get("file_size"),
+        "source":       "telegram_fallback",
+    }
+
+
+@app.get("/deezer/accounts")
+async def deezer_accounts_status():
+    """Health summary of the Deezer direct account pool."""
+    if deezer_pool is None:
+        return {
+            "accounts": {"total": 0, "available": 0, "cooling": 0,
+                         "strategy": None, "cooldown_seconds": 0},
+            "qualities": list(deezer_client.QUALITY_FORMATS.keys()),
+            "note":      "Deezer pool not initialised",
+        }
+    return {
+        "accounts":  deezer_pool.status(),
+        "qualities": list(deezer_client.QUALITY_FORMATS.keys()),
+    }
 
 
 @app.get("/beatport/accounts")

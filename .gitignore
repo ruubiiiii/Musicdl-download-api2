@@ -75,4 +75,11 @@ Thumbs.db
 # QOBUZ SESSION CACHE (contains auth tokens — never commit)
 # ============================================
 qobuz_sessions.json
+
+# ============================================
+# DEEZER ACCOUNTS & TOKEN CACHE (contains ARL tokens — never commit)
+# ============================================
+deezer_accounts.json
+.deezer_tokens/
+
 !.env.example
